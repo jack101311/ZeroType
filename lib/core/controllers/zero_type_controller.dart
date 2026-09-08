@@ -89,14 +89,21 @@ class ZeroTypeController extends _$ZeroTypeController {
     _starting = true;
     try {
       await _startRecordingInternal();
+    } catch (_) {
+      _cancelled = true;
+      await _showNativeOverlay('error', '無法開始錄音，請檢查權限與金鑰設定');
+      await Future<void>.delayed(const Duration(seconds: 3));
     } finally {
-      if (_cancelled) {
-        await _recordingService.cancelRecording();
-        await getIt<SoundService>().resumeMusic();
-        if (ref.mounted) state = const ZeroTypeState();
-        await _hideNativeOverlay();
+      try {
+        if (_cancelled) {
+          await _recordingService.cancelRecording();
+          await getIt<SoundService>().resumeMusic();
+          if (ref.mounted) state = const ZeroTypeState();
+          await _hideNativeOverlay();
+        }
+      } finally {
+        _starting = false;
       }
-      _starting = false;
     }
   }
 

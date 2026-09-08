@@ -11,13 +11,19 @@ class HistoryPlaybackService {
   HistoryPlaybackService({
     required HistoryRepository repository,
     required void Function(String?) onChanged,
+    AudioPlayer? player,
+    Future<Directory> Function()? createDirectory,
   }) : _repository = repository,
-       _onChanged = onChanged {
+       _onChanged = onChanged,
+       _player = player ?? AudioPlayer(),
+       _createDirectory =
+           createDirectory ?? PrivateFiles.createSessionDirectory {
     _completion = _player.onPlayerComplete.listen((_) => unawaited(stop()));
   }
   final HistoryRepository _repository;
   final void Function(String?) _onChanged;
-  final AudioPlayer _player = AudioPlayer();
+  final AudioPlayer _player;
+  final Future<Directory> Function() _createDirectory;
   final Lock _lock = Lock();
   StreamSubscription<void>? _completion;
   Directory? _directory;
@@ -32,8 +38,11 @@ class HistoryPlaybackService {
   }
 
   Future<void> _stop() async {
-    await _player.stop();
-    await _deleteTemporaryAudio();
+    try {
+      await _player.release();
+    } finally {
+      await _deleteTemporaryAudio();
+    }
     _playingId = null;
     if (!_disposed) _onChanged(null);
   }
@@ -51,7 +60,7 @@ class HistoryPlaybackService {
       try {
         final List<int> bytes = await _repository.readAudio(record.audioPath!);
         if (_disposed) return;
-        final Directory directory = await PrivateFiles.createSessionDirectory();
+        final Directory directory = await _createDirectory();
         _directory = directory;
         final File file = File('${directory.path}/playback.m4a');
         await file.writeAsBytes(bytes, flush: true);
