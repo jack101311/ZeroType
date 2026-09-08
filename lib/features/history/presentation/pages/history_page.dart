@@ -27,7 +27,11 @@ class _HistoryPageState extends ConsumerState<HistoryPage> {
       backgroundColor: Colors.transparent,
       body: historyAsync.when(
         loading: () => const Center(child: CircularProgressIndicator(strokeWidth: 2)),
-        error: (e, _) => Center(child: Text('載入失敗：$e')),
+        error: (e, _) => Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('無法解密或載入歷史紀錄。請確認系統安全儲存可用。'),
+          TextButton(onPressed: () => _PageHeader(records: const [], ref: ref)._confirmClearAll(context, ref),
+            child: const Text('清除無法讀取的歷史紀錄')),
+        ])),
         data: (records) => Column(
           children: [
             Expanded(
@@ -80,7 +84,7 @@ class _PageHeader extends StatelessWidget {
               ),
               const SizedBox(height: 6),
               Text(
-                '查看所有轉寫紀錄與 AI 處理結果',
+                '錄音與逐字稿已加密保存；複製的文字會留在系統剪貼簿',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                       color: Theme.of(context).colorScheme.onSurface.withAlpha(150),
                     ),
@@ -342,7 +346,7 @@ class _HistoryItemState extends ConsumerState<_HistoryItem> {
               if (hasAudio)
                 _ActionIcon(
                   icon: Icons.folder_open_outlined,
-                  tooltip: Platform.isMacOS ? '在 Finder 中顯示' : '在檔案總管中顯示',
+                  tooltip: '顯示加密音檔（僅能在本程式播放）',
                   onTap: () =>
                       ref.read(historyControllerProvider.notifier).revealInFinder(record.audioPath!),
                 ),

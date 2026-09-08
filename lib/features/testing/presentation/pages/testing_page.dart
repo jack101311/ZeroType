@@ -66,7 +66,7 @@ class _TestingPageState extends ConsumerState<TestingPage> {
             ),
             const SizedBox(height: 8),
             Text(
-              '直接在這裡測試錄音功能，錄音結束後會儲存 m4a 至桌面',
+              '測試錄音與辨識；成功後的錄音與逐字稿會加密保存於歷史紀錄',
               style: tt.bodyMedium?.copyWith(color: cs.onSurface.withAlpha(150)),
             ),
             const SizedBox(height: 32),

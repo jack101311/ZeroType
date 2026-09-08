@@ -1,4 +1,5 @@
 import 'dart:convert';
+import '../security/endpoint_policy.dart';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
@@ -21,8 +22,11 @@ class SpeechRecognitionService {
     required String model,
     required String prompt,
     String? customEndpoint,
+    CancelToken? cancelToken,
   }) async {
-    print('[SpeechRecognition] Transcribing with $provider ($model)...');
+    if (customEndpoint != null)
+      customEndpoint = EndpointPolicy.validate(customEndpoint);
+    if (cancelToken?.isCancelled ?? false) throw cancelToken!.cancelError!;
 
     switch (provider) {
       case 'openai':
@@ -32,6 +36,7 @@ class SpeechRecognitionService {
           model: model,
           prompt: prompt,
           customEndpoint: customEndpoint,
+          cancelToken: cancelToken,
         );
       case 'gemini':
         return _transcribeWithGemini(
@@ -40,6 +45,7 @@ class SpeechRecognitionService {
           model: model,
           prompt: prompt,
           customEndpoint: customEndpoint,
+          cancelToken: cancelToken,
         );
       default:
         throw Exception('不支援的語音辨識服務商：$provider');
@@ -52,6 +58,7 @@ class SpeechRecognitionService {
     required String model,
     required String prompt,
     String? customEndpoint,
+    CancelToken? cancelToken,
   }) async {
     final formData = FormData.fromMap({
       'file': await MultipartFile.fromFile(
@@ -69,8 +76,10 @@ class SpeechRecognitionService {
 
     final response = await _dio.post<dynamic>(
       url,
+      cancelToken: cancelToken,
       data: formData,
       options: Options(
+        followRedirects: false,
         headers: {'Authorization': 'Bearer $apiKey'},
       ),
     );
@@ -105,6 +114,7 @@ class SpeechRecognitionService {
     required String model,
     required String prompt,
     String? customEndpoint,
+    CancelToken? cancelToken,
   }) async {
     print('[Gemini] Start direct transcription: $audioFilePath');
 
@@ -119,8 +129,9 @@ class SpeechRecognitionService {
     final audioBytes = await fileToUpload.readAsBytes();
     final base64Audio = base64Encode(audioBytes);
 
-    final finalPrompt =
-        prompt.isEmpty ? 'Generate a transcript of the speech.' : prompt;
+    final finalPrompt = prompt.isEmpty
+        ? 'Generate a transcript of the speech.'
+        : prompt;
 
     final url = (customEndpoint != null && customEndpoint.isNotEmpty)
         ? '$customEndpoint/$model:generateContent'
@@ -129,22 +140,21 @@ class SpeechRecognitionService {
     try {
       final response = await _dio.post<Map<String, dynamic>>(
         url,
+        cancelToken: cancelToken,
         data: {
           'contents': [
             {
               'parts': [
                 {'text': finalPrompt},
                 {
-                  'inline_data': {
-                    'mime_type': mimeType,
-                    'data': base64Audio,
-                  }
+                  'inline_data': {'mime_type': mimeType, 'data': base64Audio},
                 },
               ],
             },
           ],
         },
         options: Options(
+          followRedirects: false,
           headers: {
             'x-goog-api-key': apiKey,
             'Content-Type': 'application/json',

@@ -292,8 +292,16 @@ class _ApiKeyInputState extends State<_ApiKeyInput> {
             ),
             const SizedBox(width: 12),
             ElevatedButton(
-              onPressed: () {
-                widget.onSave(_controller.text);
+              onPressed: () async {
+                try {
+                  await widget.onSave(_controller.text);
+                } catch (_) {
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('無法儲存金鑰，請檢查系統安全儲存權限。')));
+                  return;
+                }
+                if (!context.mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(content: Text('API Key 已儲存'), duration: Duration(seconds: 1)),
                 );
@@ -408,7 +416,9 @@ class _CustomEndpointInputState extends State<_CustomEndpointInput> {
               child: TextField(
                 controller: _controller,
                 decoration: InputDecoration(
-                  hintText: '非必填',
+                  hintText: 'https://…（非必填）',
+                  helperText: '此服務會收到 API Key、錄音與字典，僅填入信任的 HTTPS 接口。',
+                  helperMaxLines: 3,
                   hintStyle: TextStyle(color: cs.onSurface.withAlpha(80)),
                   filled: true,
                   fillColor: cs.surface,
@@ -427,8 +437,16 @@ class _CustomEndpointInputState extends State<_CustomEndpointInput> {
             ),
             const SizedBox(width: 12),
             ElevatedButton(
-              onPressed: () {
-                widget.onSave(_controller.text);
+              onPressed: () async {
+                try {
+                  await widget.onSave(_controller.text);
+                } catch (_) {
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                    content: Text('無法儲存：請使用 HTTPS 網址，且不要包含帳密、查詢參數或片段。')));
+                  return;
+                }
+                if (!context.mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(content: Text('接口設定已儲存'), duration: Duration(seconds: 1)),
                 );
