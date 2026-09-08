@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:zero_type/features/history/domain/repositories/history_repository.dart';
 import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:hotkey_manager/hotkey_manager.dart';
@@ -173,7 +174,9 @@ class SettingsController extends _$SettingsController {
   }
 
   Future<void> setHistoryRetentionDays(int days) async {
+    if (days < 1 || days > 365) throw ArgumentError.value(days);
     await getIt<SharedPreferences>().setInt(AppConstants.historyRetentionDaysKey, days);
+    await getIt<HistoryRepository>().purgeExpiredRecords(days);
     final currentState = state.value;
     if (currentState != null) {
       state = AsyncData(currentState.copyWith(historyRetentionDays: days));

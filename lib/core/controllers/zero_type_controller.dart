@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'package:dio/dio.dart';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -24,13 +24,21 @@ part 'zero_type_controller.g.dart';
 class ZeroTypeController extends _$ZeroTypeController {
   late final RecordingService _recordingService;
   bool _cancelled = false;
+  bool _starting = false;
+  bool _processing = false;
+  CancelToken? _requestToken;
   DateTime? _recordingStartTime;
   Timer? _maxDurationTimer;
 
   @override
   ZeroTypeState build() {
-    _recordingService = RecordingService();
-    ref.onDispose(() => _recordingService.dispose());
+    _recordingService = getIt<RecordingService>();
+    ref.onDispose(() {
+      _cancelled = true;
+      _requestToken?.cancel();
+      _maxDurationTimer?.cancel();
+      unawaited(_recordingService.dispose());
+    });
 
     // Listen for cancel signals from the native overlay (X button or ESC)
     const controlChannel = MethodChannel('com.zerotype.app/control');
@@ -42,10 +50,13 @@ class ZeroTypeController extends _$ZeroTypeController {
   }
 
   Future<void> toggleRecording() async {
-    print('[ZeroTypeController] Hotkey triggered! Current status: ${state.status}');
+    print(
+      '[ZeroTypeController] Hotkey triggered! Current status: ${state.status}',
+    );
+    if (_starting) return;
     if (state.status == ZeroTypeStatus.recording) {
       await _stopAndProcess();
-    } else if (state.status == ZeroTypeStatus.idle) {
+    } else if (state.status == ZeroTypeStatus.idle && !_processing) {
       await _startRecording();
     } else if (state.status == ZeroTypeStatus.cancelling) {
       return;
@@ -58,24 +69,54 @@ class ZeroTypeController extends _$ZeroTypeController {
     _maxDurationTimer?.cancel();
     _maxDurationTimer = null;
     _cancelled = true;
-    if (state.status == ZeroTypeStatus.recording) {
-      state = state.copyWith(status: ZeroTypeStatus.cancelling);
-      unawaited(_showNativeOverlay('cancelling', '取消中'));
-      await _recordingService.cancelRecording();
+    _requestToken?.cancel('Cancelled by user');
+    final bool wasRecording = state.status == ZeroTypeStatus.recording;
+    state = state.copyWith(status: ZeroTypeStatus.cancelling);
+    // Start/processing owns cleanup until it finishes; do not reuse its recorder.
+    if (_starting || _processing) return;
+    try {
+      if (wasRecording) await _recordingService.cancelRecording();
+      await getIt<SoundService>().playCancelSound();
+      await getIt<SoundService>().resumeMusic();
+    } finally {
+      if (ref.mounted) state = const ZeroTypeState();
+      await _hideNativeOverlay();
     }
-    await getIt<SoundService>().playCancelSound();
-    await getIt<SoundService>().resumeMusic();
-    state = const ZeroTypeState();
-    await _hideNativeOverlay();
   }
 
   Future<void> _startRecording() async {
+    if (_starting || _processing) return;
+    _starting = true;
+    try {
+      await _startRecordingInternal();
+    } catch (_) {
+      _cancelled = true;
+      await _showNativeOverlay('error', '無法開始錄音，請檢查權限與金鑰設定');
+      await Future<void>.delayed(const Duration(seconds: 3));
+    } finally {
+      try {
+        if (_cancelled) {
+          await _recordingService.cancelRecording();
+          await getIt<SoundService>().resumeMusic();
+          if (ref.mounted) state = const ZeroTypeState();
+          await _hideNativeOverlay();
+        }
+      } finally {
+        _starting = false;
+      }
+    }
+  }
+
+  Future<void> _startRecordingInternal() async {
     _cancelled = false;
 
     final config = await ref.read(speechProviderControllerProvider.future);
-    if (config.providerId == null || config.providerId!.isEmpty ||
-        config.apiKey == null || config.apiKey!.isEmpty ||
-        config.modelId == null || config.modelId!.isEmpty) {
+    if (config.providerId == null ||
+        config.providerId!.isEmpty ||
+        config.apiKey == null ||
+        config.apiKey!.isEmpty ||
+        config.modelId == null ||
+        config.modelId!.isEmpty) {
       await _showNativeOverlay('error', '請先完成語音辨識模型設定');
       await getIt<SoundService>().playCancelSound();
       await Future.delayed(const Duration(seconds: 3));
@@ -133,8 +174,12 @@ class ZeroTypeController extends _$ZeroTypeController {
     _recordingStartTime = DateTime.now();
 
     // Start max-duration safety timer from user setting (default 1 min, max 5 min)
-    final maxMinutes = getIt<SharedPreferences>()
-        .getInt(AppConstants.maxRecordingMinutesKey) ?? 1;
+    final maxMinutes =
+        (getIt<SharedPreferences>().getInt(
+                  AppConstants.maxRecordingMinutesKey,
+                ) ??
+                1)
+            .clamp(1, 5);
     _maxDurationTimer = Timer(Duration(minutes: maxMinutes), () {
       if (state.status == ZeroTypeStatus.recording) {
         print('[ZeroType] Max recording duration reached, auto-stopping.');
@@ -156,10 +201,12 @@ class ZeroTypeController extends _$ZeroTypeController {
         ),
       ]);
     } catch (e) {
+      _maxDurationTimer?.cancel();
+      await _recordingService.cancelRecording();
       if (!ref.mounted || _cancelled) return;
       state = state.copyWith(
         status: ZeroTypeStatus.error,
-        errorMessage: '錄音啟動失敗：$e',
+        errorMessage: '錄音啟動失敗',
       );
       await _showNativeOverlay('error', '錄音啟動失敗');
       await Future.delayed(const Duration(seconds: 3));
@@ -173,8 +220,9 @@ class ZeroTypeController extends _$ZeroTypeController {
   Future<TranscriptionResult?> _transcribe(String filePath) async {
     final config = await ref.read(speechProviderControllerProvider.future);
     final prompt = await ref.read(speechPromptControllerProvider.future);
-    final dictionaryPrompt =
-        await ref.read(dictionaryRepositoryProvider).buildDictionaryPrompt();
+    final dictionaryPrompt = await ref
+        .read(dictionaryRepositoryProvider)
+        .buildDictionaryPrompt();
 
     if (config.providerId == null ||
         config.apiKey == null ||
@@ -182,8 +230,9 @@ class ZeroTypeController extends _$ZeroTypeController {
       throw Exception('請先完成語音辨識模型設定');
     }
 
-    final finalPrompt =
-        dictionaryPrompt.isEmpty ? prompt : '$prompt\n\n$dictionaryPrompt';
+    final finalPrompt = dictionaryPrompt.isEmpty
+        ? prompt
+        : '$prompt\n\n$dictionaryPrompt';
 
     final service = getIt<SpeechRecognitionService>();
     return service.transcribe(
@@ -193,56 +242,48 @@ class ZeroTypeController extends _$ZeroTypeController {
       model: config.modelId!,
       prompt: finalPrompt,
       customEndpoint: config.customEndpoint,
+      cancelToken: _requestToken,
     );
   }
 
   Future<void> _stopAndProcess() async {
+    if (_processing) return;
+    _processing = true;
+    _requestToken = CancelToken();
     _maxDurationTimer?.cancel();
     _maxDurationTimer = null;
-    state = state.copyWith(status: ZeroTypeStatus.saving);
-    await _showNativeOverlay('saving', '擷取中');
-
-    final stopTime = DateTime.now();
-    final durationMs = _recordingStartTime != null
-        ? stopTime.difference(_recordingStartTime!).inMilliseconds
-        : null;
-
+    String? filePath;
+    String? savedAudio;
+    String? savedRecordId;
+    String? clipboardText;
+    bool completed = false;
+    final HistoryRepository historyRepo = getIt<HistoryRepository>();
     try {
-      final stopFuture = _recordingService.stopRecording();
-      final soundFuture = getIt<SoundService>().playStopSound();
-      getIt<SoundService>().resumeMusic();
-
-      final filePath = await stopFuture;
-      await soundFuture;
-
-      if (!ref.mounted || _cancelled || filePath == null) {
-        state = const ZeroTypeState();
-        await _hideNativeOverlay();
-        return;
-      }
-
+      state = state.copyWith(status: ZeroTypeStatus.saving);
+      await _showNativeOverlay('saving', '擷取中');
+      final DateTime stopTime = DateTime.now();
+      final int? durationMs = _recordingStartTime == null
+          ? null
+          : stopTime.difference(_recordingStartTime!).inMilliseconds;
+      filePath = await _recordingService.stopRecording();
+      await getIt<SoundService>().playStopSound();
+      if (_cancelled || !ref.mounted || filePath == null) return;
       state = state.copyWith(status: ZeroTypeStatus.transcribing);
       await _showNativeOverlay('transcribing', '辨識中');
-
       final config = await ref.read(speechProviderControllerProvider.future);
-      final result = await _transcribe(filePath);
-
-      if (result == null || result.text.isEmpty) {
-        // Cleanup temp file on empty result
-        await _recordingService.deleteFile(filePath);
-        throw Exception('未能辨識出任何文字');
-      }
-
-      // Move audio to history dir and save record
-      final historyRepo = getIt<HistoryRepository>();
-      final audioHistoryPath = await historyRepo.moveAudioFile(filePath);
-
-      final recordId = DateTime.now().millisecondsSinceEpoch.toString();
-      final record = TranscriptionRecord(
-        id: recordId,
+      if (_cancelled || !ref.mounted) return;
+      final TranscriptionResult? result = await _transcribe(filePath);
+      if (_cancelled || !ref.mounted) return;
+      if (result == null || result.text.isEmpty)
+        throw StateError('Empty transcription');
+      savedAudio = await historyRepo.moveAudioFile(filePath);
+      if (_cancelled || !ref.mounted) return;
+      savedRecordId = DateTime.now().microsecondsSinceEpoch.toString();
+      final TranscriptionRecord record = TranscriptionRecord(
+        id: savedRecordId,
         text: result.text,
         createdAt: DateTime.now(),
-        audioPath: audioHistoryPath,
+        audioPath: savedAudio,
         durationMs: durationMs,
         provider: config.providerId ?? '',
         model: config.modelId ?? '',
@@ -255,37 +296,65 @@ class ZeroTypeController extends _$ZeroTypeController {
         ),
       );
       await historyRepo.addRecord(record);
-      await historyRepo.accumulateStats(record);
-
-      // Output
-      state = state.copyWith(status: ZeroTypeStatus.done, result: result.text);
+      if (_cancelled || !ref.mounted) return;
+      clipboardText = result.text;
       await Clipboard.setData(ClipboardData(text: result.text));
-      await Future.delayed(const Duration(milliseconds: 150));
-
-      print('[ZeroType] Simulating paste...');
-      const channel = MethodChannel('com.zerotype.app/keyboard');
-      await channel.invokeMethod('simulatePaste');
-
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      if (_cancelled || !ref.mounted) return;
+      const MethodChannel channel = MethodChannel('com.zerotype.app/keyboard');
+      await channel.invokeMethod<void>('simulatePaste');
+      if (_cancelled || !ref.mounted) return;
+      completed = true;
+      await historyRepo.accumulateStats(record);
+      state = state.copyWith(status: ZeroTypeStatus.done, result: result.text);
       await _showNativeOverlay('done', '已完成');
-      await Future.delayed(const Duration(seconds: 2));
-
-      if (ref.mounted && !_cancelled) {
-        state = const ZeroTypeState();
-        await _hideNativeOverlay();
+      await Future<void>.delayed(const Duration(seconds: 2));
+    } catch (_) {
+      // Never display request details, credentials or provider response bodies.
+      if (!_cancelled && ref.mounted) {
+        state = state.copyWith(
+          status: ZeroTypeStatus.error,
+          errorMessage: '處理失敗，請檢查連線與模型設定',
+        );
+        await _showNativeOverlay('error', '處理失敗，請檢查連線與模型設定');
+        await Future<void>.delayed(const Duration(seconds: 3));
       }
-    } catch (e, st) {
-      print('[ZeroType] ERROR in _stopAndProcess: $e\n$st');
-      if (!ref.mounted || _cancelled) return;
-      state = state.copyWith(
-        status: ZeroTypeStatus.error,
-        errorMessage: e.toString(),
-      );
-      await _showNativeOverlay('error', '處理失敗：$e');
-      await getIt<SoundService>().resumeMusic();
-      await Future.delayed(const Duration(seconds: 3));
-      if (ref.mounted && !_cancelled) {
-        state = const ZeroTypeState();
-        await _hideNativeOverlay();
+    } finally {
+      try {
+        if (!completed) {
+          try {
+            if (savedRecordId != null)
+              await historyRepo.deleteRecord(savedRecordId);
+          } finally {
+            try {
+              if (savedAudio != null)
+                await historyRepo.discardAudio(savedAudio);
+            } finally {
+              if (clipboardText != null) {
+                try {
+                  final ClipboardData? current = await Clipboard.getData(
+                    Clipboard.kTextPlain,
+                  );
+                  if (current?.text == clipboardText) {
+                    await Clipboard.setData(const ClipboardData(text: ''));
+                  }
+                } catch (_) {
+                  // Clipboard access must not block recording/history cleanup.
+                }
+              }
+            }
+          }
+        }
+      } finally {
+        try {
+          if (filePath != null) await _recordingService.deleteFile(filePath);
+          await getIt<SoundService>().resumeMusic();
+        } finally {
+          _requestToken = null;
+          _processing = false;
+          if (ref.mounted) state = const ZeroTypeState();
+          await _hideNativeOverlay();
+        }
       }
     }
   }

@@ -112,3 +112,10 @@ flutter run -d macos
 ## 📝 License
 
 MIT — 自由使用、修改、散布，唯需自備 API Key。
+
+
+## Security hardening in this fork
+
+API keys now use the OS secure vault. Existing transcripts and history recordings migrate to authenticated encryption on first access. Custom endpoints require HTTPS; authenticated redirects are disabled. Cancellation aborts requests and prevents late results from being saved or pasted. History playback no longer invokes PowerShell. Retention runs periodically while the app is open.
+
+See [SECURITY.md](SECURITY.md) for migration, temporary-file retention, macOS signing requirements and remaining limits. The encrypted history format is not readable by older versions.

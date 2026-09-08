@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'dart:async';
+import 'core/security/private_files.dart';
+import 'core/security/secure_vault.dart';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,11 +15,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'core/constants/app_constants.dart';
 import 'core/controllers/zero_type_controller.dart';
 import 'core/di/injection.dart';
-import 'core/router/app_router.dart';
 import 'core/router/router_provider.dart';
 import 'core/services/hotkey_service.dart';
 import 'core/services/tray_service.dart';
-import 'core/state/zero_type_state.dart';
 import 'core/theme/app_theme.dart';
 import 'core/theme/theme_controller.dart';
 import 'features/history/domain/repositories/history_repository.dart';
@@ -93,6 +94,8 @@ class _AppInitializer extends ConsumerStatefulWidget {
 
 class _AppInitializerState extends ConsumerState<_AppInitializer>
     with WindowListener {
+  Timer? _historyCleanupTimer;
+  bool _cleaningHistory = false;
   final _hotkeyService = getIt<HotkeyService>();
   final _trayService = getIt<TrayService>();
 
@@ -112,10 +115,26 @@ class _AppInitializerState extends ConsumerState<_AppInitializer>
       onQuit: _quit,
     );
 
-    // Auto-purge expired history records on startup
-    final prefs = getIt<SharedPreferences>();
-    final retentionDays = prefs.getInt(AppConstants.historyRetentionDaysKey) ?? 7;
-    await getIt<HistoryRepository>().purgeExpiredRecords(retentionDays);
+    await _purgeHistory();
+    _historyCleanupTimer = Timer.periodic(const Duration(minutes: 15), (_) => unawaited(_purgeHistory()));
+  }
+
+  Future<void> _purgeHistory() async {
+    if (_cleaningHistory) return;
+    _cleaningHistory = true;
+    try {
+      await getIt<SecureVault>().migrateApiKeys();
+      final SharedPreferences prefs = getIt<SharedPreferences>();
+      final int retentionDays = (prefs.getInt(AppConstants.historyRetentionDaysKey) ?? 7).clamp(1, 365);
+      await getIt<HistoryRepository>().purgeExpiredRecords(retentionDays);
+      await PrivateFiles.purgeStaleTemporaryFiles();
+    } catch (_) {
+      // Keep corrupt/encryption-locked history intact; it can be cleared in History.
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('金鑰或歷史資料無法存取，請檢查系統安全儲存權限。')));
+    } finally {
+      _cleaningHistory = false;
+    }
   }
 
   Future<void> _onHotkeyActivated() async {
@@ -140,6 +159,7 @@ class _AppInitializerState extends ConsumerState<_AppInitializer>
 
   @override
   void dispose() {
+    _historyCleanupTimer?.cancel();
     windowManager.removeListener(this);
     _hotkeyService.dispose();
     _trayService.dispose();

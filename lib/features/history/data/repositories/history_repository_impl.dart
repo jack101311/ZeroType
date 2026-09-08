@@ -1,166 +1,269 @@
 import 'dart:convert';
 import 'dart:io';
-
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-
+import 'package:synchronized/synchronized.dart';
+import 'package:zero_type/core/security/private_files.dart';
+import 'package:zero_type/core/security/secure_vault.dart';
 import '../../domain/entities/history_stats.dart';
 import '../../domain/entities/transcription_record.dart';
 import '../../domain/repositories/history_repository.dart';
 
 class HistoryRepositoryImpl implements HistoryRepository {
-  static const _historyFileName = 'history.json';
-  static const _statsFileName = 'history_stats.json';
-  static const _audioDirName = 'history_audio';
+  HistoryRepositoryImpl({
+    required SecureVault vault,
+    Future<Directory> Function()? directory,
+  }) : _vault = vault,
+       _directory = directory ?? getApplicationSupportDirectory;
+  final SecureVault _vault;
+  final Future<Directory> Function() _directory;
+  final Lock _lock = Lock();
 
-  Future<Directory> _appSupportDir() async =>
-      getApplicationSupportDirectory();
-
-  Future<File> _historyFile() async {
-    final dir = await _appSupportDir();
-    return File('${dir.path}/$_historyFileName');
-  }
-
-  Future<File> _statsFile() async {
-    final dir = await _appSupportDir();
-    return File('${dir.path}/$_statsFileName');
+  Future<File> _file(String name) async {
+    final Directory directory = await _directory();
+    await directory.create(recursive: true);
+    return File(p.join(directory.path, name));
   }
 
   Future<Directory> _audioDir() async {
-    final dir = await _appSupportDir();
-    final audioDir = Directory('${dir.path}/$_audioDirName');
-    if (!audioDir.existsSync()) audioDir.createSync(recursive: true);
-    return audioDir;
+    final Directory directory = Directory(
+      p.join((await _directory()).path, 'history_audio'),
+    );
+    if (await FileSystemEntity.type(directory.path, followLinks: false) ==
+        FileSystemEntityType.link) {
+      throw const FileSystemException('Refusing linked history directory');
+    }
+    await directory.create(recursive: true);
+    return directory;
   }
 
-  @override
-  Future<List<TranscriptionRecord>> getRecords() async {
-    final file = await _historyFile();
-    if (!file.existsSync()) return [];
-    try {
-      final raw = await file.readAsString();
-      final list = jsonDecode(raw) as List<dynamic>;
-      final records = list
-          .map((e) => TranscriptionRecord.fromJson(e as Map<String, dynamic>))
-          .toList();
-      // Newest first
-      records.sort((a, b) => b.createdAt.compareTo(a.createdAt));
-      return records;
-    } catch (e) {
-      print('[HistoryRepository] Failed to parse history.json: $e');
-      return [];
-    }
+  /// Treat legacy JSON paths as untrusted, including links and non-audio files.
+  Future<File?> _safeAudio(String? path) async {
+    if (path == null) return null;
+    final Directory directory = await _audioDir();
+    final String normalized = p.normalize(p.absolute(path));
+    if (p.dirname(normalized) != p.normalize(p.absolute(directory.path)) ||
+        !RegExp(
+          r'^zerotype_\d+\.m4a(?:\.ztenc)?$',
+        ).hasMatch(p.basename(normalized)))
+      return null;
+    if (await FileSystemEntity.type(normalized, followLinks: false) !=
+        FileSystemEntityType.file)
+      return null;
+    return File(normalized);
   }
 
   Future<void> _saveRecords(List<TranscriptionRecord> records) async {
-    final file = await _historyFile();
-    final json = jsonEncode(records.map((r) => r.toJson()).toList());
-    await file.writeAsString(json);
+    final List<int> bytes = utf8.encode(
+      jsonEncode(
+        records.map((TranscriptionRecord record) => record.toJson()).toList(),
+      ),
+    );
+    await PrivateFiles.writeAtomically(
+      await _file('history.ztenc'),
+      await _vault.encrypt(bytes),
+    );
   }
 
-  @override
-  Future<void> addRecord(TranscriptionRecord record) async {
-    final records = await getRecords();
-    // Insert at front (already sorted newest-first from getRecords)
-    records.insert(0, record);
-    await _saveRecords(records);
-  }
-
-  @override
-  Future<void> deleteRecord(String id) async {
-    final records = await getRecords();
-    final target = records.firstWhere((r) => r.id == id,
-        orElse: () => throw StateError('Record $id not found'));
-    // Delete audio file if it exists
-    if (target.audioPath != null) {
-      final f = File(target.audioPath!);
-      if (f.existsSync()) await f.delete();
+  Future<List<TranscriptionRecord>> _readRecords() async {
+    final File encrypted = await _file('history.ztenc');
+    final File legacy = await _file('history.json');
+    if (await encrypted.exists()) {
+      final List<TranscriptionRecord> records = _decode(
+        await _vault.decrypt(await encrypted.readAsBytes()),
+      );
+      // Recover an interrupted migration only after authenticating the new index.
+      if (await legacy.exists()) await _removeLegacyFiles(legacy);
+      return records;
     }
-    records.removeWhere((r) => r.id == id);
-    await _saveRecords(records);
+    if (!await legacy.exists()) return [];
+    final List<TranscriptionRecord> records = _decode(
+      await legacy.readAsBytes(),
+    );
+    final List<TranscriptionRecord> migrated = [];
+    for (final TranscriptionRecord record in records) {
+      final Map<String, dynamic> json = record.toJson();
+      final File? audio = await _safeAudio(record.audioPath);
+      json['audioPath'] = audio == null ? null : await _encryptAudio(audio);
+      migrated.add(TranscriptionRecord.fromJson(json));
+    }
+    await _saveRecords(migrated);
+    await _removeLegacyFiles(legacy);
+    return migrated;
+  }
+
+  List<TranscriptionRecord> _decode(List<int> bytes) {
+    final List<dynamic> values =
+        jsonDecode(utf8.decode(bytes)) as List<dynamic>;
+    final List<TranscriptionRecord> records = values
+        .map(
+          (dynamic value) =>
+              TranscriptionRecord.fromJson(value as Map<String, dynamic>),
+        )
+        .toList();
+    records.sort(
+      (TranscriptionRecord a, TranscriptionRecord b) =>
+          b.createdAt.compareTo(a.createdAt),
+    );
+    return records;
+  }
+
+  Future<void> _removeLegacyFiles(File legacy) async {
+    for (final TranscriptionRecord record in _decode(
+      await legacy.readAsBytes(),
+    )) {
+      final File? audio = await _safeAudio(record.audioPath);
+      if (audio != null && !audio.path.endsWith('.ztenc')) await audio.delete();
+    }
+    await legacy.delete();
+  }
+
+  Future<String> _encryptAudio(File source) async {
+    if (source.path.endsWith('.ztenc')) return source.path;
+    final File target = File(
+      p.join((await _audioDir()).path, '${p.basename(source.path)}.ztenc'),
+    );
+    await PrivateFiles.writeAtomically(
+      target,
+      await _vault.encrypt(await source.readAsBytes()),
+    );
+    return target.path;
   }
 
   @override
-  Future<void> clearAll() async {
-    final records = await getRecords();
-    for (final r in records) {
-      if (r.audioPath != null) {
-        final f = File(r.audioPath!);
-        if (f.existsSync()) await f.delete();
-      }
+  Future<List<TranscriptionRecord>> getRecords() =>
+      _lock.synchronized(_readRecords);
+
+  @override
+  Future<void> addRecord(TranscriptionRecord record) =>
+      _lock.synchronized(() async {
+        final List<TranscriptionRecord> records = await _readRecords();
+        records.insert(0, record);
+        await _saveRecords(records);
+      });
+
+  @override
+  Future<void> deleteRecord(String id) => _lock.synchronized(() async {
+    final List<TranscriptionRecord> records = await _readRecords();
+    for (final TranscriptionRecord record in records.where(
+      (TranscriptionRecord record) => record.id == id,
+    )) {
+      await _deleteAudio(record.audioPath);
     }
-    final file = await _historyFile();
-    if (file.existsSync()) await file.delete();
-    // Remove audio dir contents but keep dir
-    final audioDir = await _audioDir();
-    if (audioDir.existsSync()) {
-      for (final entry in audioDir.listSync()) {
+    records.removeWhere((TranscriptionRecord record) => record.id == id);
+    await _saveRecords(records);
+  });
+
+  Future<void> _deleteAudio(String? path) async {
+    final File? file = await _safeAudio(path);
+    if (file != null) await file.delete();
+  }
+
+  @override
+  Future<void> clearAll() => _lock.synchronized(() async {
+    // Deletion must work even if the encryption key is lost or the index is corrupt.
+    for (final String name in [
+      'history.ztenc',
+      'history.ztenc.tmp',
+      'history.json',
+      'history_stats.json',
+    ]) {
+      final File file = await _file(name);
+      if (await file.exists()) await file.delete();
+    }
+    await for (final FileSystemEntity entry in (await _audioDir()).list(
+      followLinks: false,
+    )) {
+      if (entry is File || entry is Link) await entry.delete();
+    }
+  });
+
+  @override
+  Future<void> purgeExpiredRecords(
+    int retentionDays,
+  ) => _lock.synchronized(() async {
+    if (retentionDays < 1 || retentionDays > 365)
+      throw ArgumentError.value(retentionDays);
+    final DateTime cutoff = DateTime.now().subtract(
+      Duration(days: retentionDays),
+    );
+    final List<TranscriptionRecord> records = await _readRecords();
+    for (final TranscriptionRecord record in records.where(
+      (TranscriptionRecord record) => record.createdAt.isBefore(cutoff),
+    )) {
+      await _deleteAudio(record.audioPath);
+    }
+    records.removeWhere(
+      (TranscriptionRecord record) => record.createdAt.isBefore(cutoff),
+    );
+    await _saveRecords(records);
+    final Set<String> referenced = records
+        .map((TranscriptionRecord record) => record.audioPath)
+        .whereType<String>()
+        .toSet();
+    await for (final FileSystemEntity entry in (await _audioDir()).list(
+      followLinks: false,
+    )) {
+      // Do not race an in-flight transcription that has not committed its index yet.
+      if (entry is File &&
+          !referenced.contains(entry.path) &&
+          (await entry.stat()).modified.isBefore(
+            DateTime.now().subtract(const Duration(days: 1)),
+          )) {
         await entry.delete();
       }
     }
-    await resetStats();
+  });
+
+  @override
+  Future<String?> moveAudioFile(String srcPath) => _lock.synchronized(() async {
+    final File source = File(srcPath);
+    if (!RegExp(r'^zerotype_\d+\.m4a$').hasMatch(p.basename(srcPath)))
+      throw const FormatException('Invalid recording filename');
+    if (!await source.exists()) return null;
+    final String destination = await _encryptAudio(source);
+    await source.delete();
+    return destination;
+  });
+
+  @override
+  Future<List<int>> readAudio(String path) => _lock.synchronized(() async {
+    final File? file = await _safeAudio(path);
+    if (file == null || !path.endsWith('.ztenc'))
+      throw const FileSystemException('Invalid encrypted recording');
+    return _vault.decrypt(await file.readAsBytes());
+  });
+
+  @override
+  Future<void> discardAudio(String path) =>
+      _lock.synchronized(() => _deleteAudio(path));
+
+  Future<HistoryStats> _readStats() async {
+    final File file = await _file('history_stats.json');
+    if (!await file.exists()) return HistoryStats.zero;
+    return HistoryStats.fromJson(
+      jsonDecode(await file.readAsString()) as Map<String, dynamic>,
+    );
   }
 
   @override
-  Future<void> purgeExpiredRecords(int retentionDays) async {
-    final cutoff =
-        DateTime.now().subtract(Duration(days: retentionDays));
-    final records = await getRecords();
-    final expired = records.where((r) => r.createdAt.isBefore(cutoff)).toList();
-    if (expired.isEmpty) return;
-
-    for (final r in expired) {
-      if (r.audioPath != null) {
-        final f = File(r.audioPath!);
-        if (f.existsSync()) await f.delete();
-      }
-    }
-    final remaining = records.where((r) => r.createdAt.isAfter(cutoff) || r.createdAt == cutoff).toList();
-    await _saveRecords(remaining);
-    print('[HistoryRepository] Purged ${expired.length} expired records.');
-  }
+  Future<HistoryStats> getStats() => _lock.synchronized(_readStats);
 
   @override
-  Future<String?> moveAudioFile(String srcPath) async {
-    final srcFile = File(srcPath);
-    if (!srcFile.existsSync()) return null;
-
-    final audioDir = await _audioDir();
-    final filename = srcFile.uri.pathSegments.last;
-    final destPath = '${audioDir.path}/$filename';
-
-    try {
-      await srcFile.rename(destPath);
-    } catch (_) {
-      // Cross-filesystem fallback
-      await srcFile.copy(destPath);
-      await srcFile.delete();
-    }
-    return destPath;
-  }
+  Future<void> accumulateStats(TranscriptionRecord record) =>
+      _lock.synchronized(() async {
+        final HistoryStats updated = (await _readStats()).addRecord(
+          record.costUsd,
+        );
+        await PrivateFiles.writeAtomically(
+          await _file('history_stats.json'),
+          utf8.encode(jsonEncode(updated.toJson())),
+        );
+      });
 
   @override
-  Future<HistoryStats> getStats() async {
-    final file = await _statsFile();
-    if (!file.existsSync()) return HistoryStats.zero;
-    try {
-      final raw = await file.readAsString();
-      return HistoryStats.fromJson(jsonDecode(raw) as Map<String, dynamic>);
-    } catch (_) {
-      return HistoryStats.zero;
-    }
-  }
-
-  @override
-  Future<void> accumulateStats(TranscriptionRecord record) async {
-    final current = await getStats();
-    final updated = current.addRecord(record.costUsd);
-    final file = await _statsFile();
-    await file.writeAsString(jsonEncode(updated.toJson()));
-  }
-
-  @override
-  Future<void> resetStats() async {
-    final file = await _statsFile();
-    if (file.existsSync()) await file.delete();
-  }
+  Future<void> resetStats() => _lock.synchronized(() async {
+    final File file = await _file('history_stats.json');
+    if (await file.exists()) await file.delete();
+  });
 }

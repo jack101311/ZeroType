@@ -28,6 +28,12 @@ dependencies:
   json_annotation: ^4.9.0
 
 
+  # Sensitive local data and native audio playback
+  flutter_secure_storage: ^10.0.0
+  cryptography: ^2.7.0
+  synchronized: ^3.3.0
+  audioplayers: ^6.5.0
+
   # Recording
   record: ^6.2.0
 
@@ -55,6 +61,7 @@ dependencies:
   package_info_plus: ^9.0.0
 
 dev_dependencies:
+  mocktail: ^1.0.4
   flutter_test:
     sdk: flutter
 

@@ -1,0 +1,36 @@
+name: Security regression checks
+on:
+  pull_request:
+  push:
+    branches: [master]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.47.2'
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - run: flutter test --reporter expanded
+      - if: runner.os == 'macOS'
+        run: flutter build macos --debug --config-only
+      - if: runner.os == 'macOS'
+        working-directory: macos
+        run: pod install
+      - if: runner.os == 'macOS'
+        run: xcodebuild -workspace macos/Runner.xcworkspace -scheme Runner -configuration Debug -derivedDataPath build/ci-macos CODE_SIGNING_ALLOWED=NO build
+      - if: runner.os == 'Windows'
+        run: flutter build windows --debug

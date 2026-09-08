@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:zero_type/core/services/history_playback_service.dart';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -37,70 +38,35 @@ class PlayingRecordId extends _$PlayingRecordId {
 
 @riverpod
 class HistoryController extends _$HistoryController {
-  Process? _macProcess; // macOS afplay
+  late HistoryPlaybackService _playback;
 
   @override
   Future<List<TranscriptionRecord>> build() async {
-    ref.onDispose(_killProcess);
+    final HistoryPlaybackService playback = HistoryPlaybackService(
+      repository: getIt<HistoryRepository>(),
+      onChanged: (String? id) {
+        if (ref.mounted) ref.read(playingRecordIdProvider.notifier).set(id);
+      },
+    );
+    _playback = playback;
+    ref.onDispose(() => unawaited(playback.dispose()));
     return getIt<HistoryRepository>().getRecords();
   }
 
-  // Safe to call from onDispose — does NOT touch ref
-  void _killProcess() {
-    _macProcess?.kill();
-    _macProcess = null;
-  }
+  Future<void> _stopPlayback() => _playback.stop();
 
-  void _stopPlayback() {
-    _killProcess();
-    ref.read(playingRecordIdProvider.notifier).set(null);
-  }
-
-  Future<void> togglePlay(TranscriptionRecord record) async {
-    final currentId = ref.read(playingRecordIdProvider);
-    final audioPath = record.audioPath;
-    if (audioPath == null) return;
-
-    if (currentId == record.id) {
-      // Stop current playback
-      _stopPlayback();
-      return;
-    }
-
-    // Stop any existing playback first
-    _stopPlayback();
-
-    // Start new playback
-    ref.read(playingRecordIdProvider.notifier).set(record.id);
-
-    if (Platform.isMacOS) {
-      _macProcess = await Process.start('afplay', [audioPath]);
-      _macProcess!.exitCode.then((_) {
-        if (ref.read(playingRecordIdProvider) == record.id) {
-          ref.read(playingRecordIdProvider.notifier).set(null);
-        }
-        _macProcess = null;
-      });
-    } else if (Platform.isWindows) {
-      // On Windows, open with default media player (no background control)
-      // audioplayers integration can be added here if needed
-      await Process.run('powershell', [
-        '-Command',
-        'Start-Process "$audioPath"',
-      ]);
-      ref.read(playingRecordIdProvider.notifier).set(null);
-    }
-  }
+  Future<void> togglePlay(TranscriptionRecord record) =>
+      _playback.toggle(record);
 
   Future<void> revealInFinder(String audioPath) async {
     try {
       if (Platform.isMacOS) {
         await Process.run('open', ['-R', audioPath]);
       } else if (Platform.isWindows) {
-        await Process.run(
-          'explorer.exe',
-          ['/select,', audioPath.replaceAll('/', '\\')],
-        );
+        await Process.run('explorer.exe', [
+          '/select,',
+          audioPath.replaceAll('/', '\\'),
+        ]);
       }
     } catch (e) {
       print('[HistoryController] revealInFinder error: $e');
@@ -113,13 +79,13 @@ class HistoryController extends _$HistoryController {
 
   Future<void> deleteRecord(String id) async {
     final currentId = ref.read(playingRecordIdProvider);
-    if (currentId == id) _stopPlayback();
+    if (currentId == id) await _stopPlayback();
     await getIt<HistoryRepository>().deleteRecord(id);
     ref.invalidateSelf();
   }
 
   Future<void> clearAll() async {
-    _stopPlayback();
+    await _stopPlayback();
     await getIt<HistoryRepository>().clearAll();
     ref.invalidateSelf();
   }

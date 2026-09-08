@@ -1,3 +1,4 @@
+import 'package:zero_type/core/security/secure_vault.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:zero_type/core/di/injection.dart';
 import 'package:zero_type/features/model_config/data/repositories/model_config_repository_impl.dart';
@@ -9,6 +10,7 @@ part 'model_config_controller.g.dart';
 
 ModelConfigRepository _buildRepository() => ModelConfigRepositoryImpl(
       prefs: getIt<SharedPreferences>(),
+      vault: getIt<SecureVault>(),
     );
 
 @riverpod
