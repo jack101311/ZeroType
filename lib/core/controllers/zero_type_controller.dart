@@ -89,7 +89,8 @@ class ZeroTypeController extends _$ZeroTypeController {
     _starting = true;
     try {
       await _startRecordingInternal();
-    } catch (_) {
+    } catch (e, s) {
+      print('[ZeroType] _startRecordingInternal threw: $e\n$s');
       _cancelled = true;
       await _showNativeOverlay('error', '無法開始錄音，請檢查權限與金鑰設定');
       await Future<void>.delayed(const Duration(seconds: 3));
@@ -200,7 +201,8 @@ class ZeroTypeController extends _$ZeroTypeController {
           },
         ),
       ]);
-    } catch (e) {
+    } catch (e, s) {
+      print('[ZeroType] recorder.start failed: $e\n$s');
       _maxDurationTimer?.cancel();
       await _recordingService.cancelRecording();
       if (!ref.mounted || _cancelled) return;
