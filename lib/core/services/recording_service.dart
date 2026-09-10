@@ -37,11 +37,15 @@ class RecordingService {
     _currentFilePath = '${dir.path}/zerotype_$timestamp.m4a';
 
     print('[RecordingService] starting at $_currentFilePath');
+    // Windows Media Foundation's AAC encoder only accepts 44100/48000 Hz;
+    // 16000 Hz makes start() fail with MF_E_INVALIDMEDIATYPE. macOS has no
+    // such restriction, so keep the smaller files there.
+    final sampleRate = Platform.isWindows ? 44100 : 16000;
     await _recorder.start(
-      const RecordConfig(
+      RecordConfig(
         encoder: AudioEncoder.aacLc,
         bitRate: 128000,
-        sampleRate: 16000,
+        sampleRate: sampleRate,
       ),
       path: _currentFilePath!,
     );
