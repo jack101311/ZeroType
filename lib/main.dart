@@ -21,7 +21,6 @@ import 'core/services/tray_service.dart';
 import 'core/theme/app_theme.dart';
 import 'core/theme/theme_controller.dart';
 import 'features/history/domain/repositories/history_repository.dart';
-import 'shared/widgets/recording_overlay.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,12 +72,7 @@ class ZeroTypeApp extends ConsumerWidget {
       routerConfig: appRouter.config(),
       debugShowCheckedModeBanner: false,
       builder: (context, child) => _AppInitializer(
-        child: Stack(
-          children: [
-            child ?? const SizedBox.shrink(),
-            const RecordingOverlay(),
-          ],
-        ),
+        child: child ?? const SizedBox.shrink(),
       ),
     );
   }

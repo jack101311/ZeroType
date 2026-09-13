@@ -5,7 +5,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:zero_type/core/di/injection.dart';
 import 'package:zero_type/core/router/app_router.dart';
 import 'package:zero_type/features/history/presentation/controllers/history_controller.dart';
-import 'package:zero_type/shared/widgets/recording_overlay.dart';
 
 @RoutePage()
 class MainShellPage extends ConsumerStatefulWidget {
@@ -89,13 +88,7 @@ class _MainShellPageState extends ConsumerState<MainShellPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        _buildMain(),
-        const RecordingOverlay(),
-      ],
-    );
+    return _buildMain();
   }
 
   Widget _buildMain() {

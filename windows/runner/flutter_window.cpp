@@ -43,6 +43,7 @@ bool FlutterWindow::OnCreate() {
 
 void FlutterWindow::OnDestroy() {
   if (flutter_controller_) {
+    TeardownChannels();
     flutter_controller_ = nullptr;
   }
 

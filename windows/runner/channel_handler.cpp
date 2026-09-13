@@ -6,6 +6,10 @@
 #include <flutter/encodable_value.h>
 
 #include <memory>
+#include <string>
+#include <variant>
+
+#include "overlay_window.h"
 
 // Keep channels alive for the duration of the app
 static std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>>
@@ -16,6 +20,9 @@ static std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>>
     g_overlay_channel;
 static std::shared_ptr<flutter::MethodChannel<flutter::EncodableValue>>
     g_control_channel;
+// Raw pointer: destroyed in TeardownChannels() on the platform thread, never
+// by static destructors (Dart's exit() may run those on another thread).
+static OverlayWindow* g_overlay = nullptr;
 
 // Simulates Ctrl+V (Windows paste shortcut) using Win32 SendInput.
 // Equivalent to macOS CGEvent Cmd+V in AppDelegate.swift.
@@ -86,9 +93,19 @@ void SetupChannels(flutter::BinaryMessenger* messenger) {
         }
       });
 
-  // ── Overlay channel (stub) ──────────────────────────────────────────────
-  // On Windows, overlay is handled by the Flutter RecordingOverlay widget.
-  // These stubs prevent MissingPluginException on the Dart side.
+  // ── Control channel ─────────────────────────────────────────────────────
+  // Native → Dart: "cancel" when the overlay X button or ESC is pressed.
+  g_control_channel =
+      std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
+          messenger, "com.zerotype.app/control",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  // ── Overlay channel ─────────────────────────────────────────────────────
+  // Floating always-on-top recording indicator (see overlay_window.h).
+  g_overlay = new OverlayWindow([]() {
+    if (g_control_channel) g_control_channel->InvokeMethod("cancel", nullptr);
+  });
+
   g_overlay_channel =
       std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
           messenger, "com.zerotype.app/overlay",
@@ -98,23 +115,51 @@ void SetupChannels(flutter::BinaryMessenger* messenger) {
       [](const flutter::MethodCall<flutter::EncodableValue>& call,
          std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
              result) {
-        // Dart side already has try-catch; stubs are just a safety net
-        result->Success(nullptr);
+        const auto* args =
+            std::get_if<flutter::EncodableMap>(call.arguments());
+        const std::string& method = call.method_name();
+        if (method == "show") {
+          std::string status = "recording";
+          std::string message;
+          if (args) {
+            auto it = args->find(flutter::EncodableValue("status"));
+            if (it != args->end()) {
+              if (const auto* v = std::get_if<std::string>(&it->second)) {
+                status = *v;
+              }
+            }
+            it = args->find(flutter::EncodableValue("message"));
+            if (it != args->end()) {
+              if (const auto* v = std::get_if<std::string>(&it->second)) {
+                message = *v;
+              }
+            }
+          }
+          if (g_overlay) g_overlay->Show(status, message);
+          result->Success(nullptr);
+        } else if (method == "hide") {
+          if (g_overlay) g_overlay->Hide();
+          result->Success(nullptr);
+        } else if (method == "updateAmplitude") {
+          double amplitude = 0.0;
+          if (args) {
+            auto it = args->find(flutter::EncodableValue("amplitude"));
+            if (it != args->end()) {
+              if (const auto* v = std::get_if<double>(&it->second)) {
+                amplitude = *v;
+              }
+            }
+          }
+          if (g_overlay) g_overlay->UpdateAmplitude(amplitude);
+          result->Success(nullptr);
+        } else {
+          result->NotImplemented();
+        }
       });
+}
 
-  // ── Control channel (stub) ──────────────────────────────────────────────
-  // On Windows, cancel is triggered directly from the Flutter overlay widget.
-  // The Dart side sets a handler on this channel; the native side is not
-  // expected to invoke it on Windows.
-  g_control_channel =
-      std::make_shared<flutter::MethodChannel<flutter::EncodableValue>>(
-          messenger, "com.zerotype.app/control",
-          &flutter::StandardMethodCodec::GetInstance());
-
-  g_control_channel->SetMethodCallHandler(
-      [](const flutter::MethodCall<flutter::EncodableValue>& call,
-         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
-             result) {
-        result->Success(nullptr);
-      });
+void TeardownChannels() {
+  delete g_overlay;
+  g_overlay = nullptr;
+  if (g_overlay_channel) g_overlay_channel->SetMethodCallHandler(nullptr);
 }
